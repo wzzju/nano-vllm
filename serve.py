@@ -115,10 +115,14 @@ def init_engine_from_env() -> AsyncLLM:
         raise RuntimeError("NANOVLLM_MODEL is required")
     tp = int(os.environ.get("NANOVLLM_TP", "1"))
     max_model_len = int(os.environ.get("NANOVLLM_MAX_MODEL_LEN", "4096"))
-    max_num_batched_tokens = int(os.environ.get("NANOVLLM_MAX_BATCHED_TOKENS", str(max(16384, max_model_len))))
+    max_num_batched_tokens = int(
+        os.environ.get("NANOVLLM_MAX_BATCHED_TOKENS", str(max(16384, max_model_len)))
+    )
     enforce_eager = os.environ.get("NANOVLLM_ENFORCE_EAGER", "0") == "1"
     shm_name = os.environ.get("NANOVLLM_SHM_NAME", f"nanovllm-{os.getpid()}")
-    return create_engine(model_path, tp, max_model_len, max_num_batched_tokens, enforce_eager, shm_name)
+    return create_engine(
+        model_path, tp, max_model_len, max_num_batched_tokens, enforce_eager, shm_name
+    )
 
 
 async def engine_loop():
@@ -158,19 +162,27 @@ async def run_request(prompt_token_ids: List[int], sampling_params: SamplingPara
     return token_ids
 
 
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global engine
     if engine is None:
         engine = init_engine_from_env()
     task = asyncio.create_task(engine_loop())
-    yield
-    task.cancel()
     try:
-        await task
-    except asyncio.CancelledError:
-        pass
+        yield
+    finally:
+        for future in request_futures.values():
+            if not future.done():
+                future.cancel()
+        request_futures.clear()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        if engine is not None:
+            engine.exit()
+            engine = None
 
 
 app = FastAPI(title="Nano-vLLM Server", lifespan=lifespan)
@@ -299,6 +311,8 @@ if __name__ == "__main__":
 
     max_batched = args.max_num_batched_tokens or max(16384, args.max_model_len)
     shm_name = args.shm_name or f"nanovllm-{os.getpid()}"
-    engine = create_engine(args.model, args.tp, args.max_model_len, max_batched, args.enforce_eager, shm_name)
+    engine = create_engine(
+        args.model, args.tp, args.max_model_len, max_batched, args.enforce_eager, shm_name
+    )
 
     uvicorn.run(app, host=args.host, port=args.port)
