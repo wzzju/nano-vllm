@@ -56,6 +56,30 @@ class ChatCompletionResponse(BaseModel):
     usage: Dict[str, int]
 
 
+class CompletionRequest(BaseModel):
+    model: str
+    prompt: Union[str, List[str]]
+    max_tokens: Optional[int] = 2048
+    temperature: Optional[float] = 0.7
+    top_p: Optional[float] = 1.0
+    stream: Optional[bool] = False
+
+
+class CompletionResponseChoice(BaseModel):
+    index: int
+    text: str
+    finish_reason: str
+
+
+class CompletionResponse(BaseModel):
+    id: str
+    object: str = "text_completion"
+    created: int
+    model: str
+    choices: List[CompletionResponseChoice]
+    usage: Dict[str, int]
+
+
 class ModelCard(BaseModel):
     id: str
     object: str = "model"
@@ -73,6 +97,7 @@ def create_engine(
     max_model_len: int,
     max_num_batched_tokens: int,
     enforce_eager: bool,
+    shm_name: str,
 ) -> AsyncLLM:
     return AsyncLLM(
         os.path.expanduser(model_path),
@@ -80,6 +105,7 @@ def create_engine(
         max_model_len=max_model_len,
         max_num_batched_tokens=max_num_batched_tokens,
         enforce_eager=enforce_eager,
+        shm_name=shm_name,
     )
 
 
@@ -91,7 +117,8 @@ def init_engine_from_env() -> AsyncLLM:
     max_model_len = int(os.environ.get("NANOVLLM_MAX_MODEL_LEN", "4096"))
     max_num_batched_tokens = int(os.environ.get("NANOVLLM_MAX_BATCHED_TOKENS", str(max(16384, max_model_len))))
     enforce_eager = os.environ.get("NANOVLLM_ENFORCE_EAGER", "0") == "1"
-    return create_engine(model_path, tp, max_model_len, max_num_batched_tokens, enforce_eager)
+    shm_name = os.environ.get("NANOVLLM_SHM_NAME", f"nanovllm-{os.getpid()}")
+    return create_engine(model_path, tp, max_model_len, max_num_batched_tokens, enforce_eager, shm_name)
 
 
 async def engine_loop():
@@ -114,6 +141,22 @@ async def engine_loop():
             if future and not future.done():
                 future.set_result(token_ids)
         await asyncio.sleep(0)
+
+
+async def run_request(prompt_token_ids: List[int], sampling_params: SamplingParams) -> List[int]:
+    future = asyncio.get_running_loop().create_future()
+    seq_id = engine.add_request(prompt_token_ids, sampling_params)
+    request_futures[seq_id] = future
+    try:
+        token_ids = await future
+    except asyncio.CancelledError:
+        request_futures.pop(seq_id, None)
+        raise
+    except Exception as e:
+        request_futures.pop(seq_id, None)
+        raise HTTPException(status_code=500, detail=f"Inference failed: {str(e)}")
+    return token_ids
+
 
 
 @asynccontextmanager
@@ -168,18 +211,7 @@ async def chat_completions(request: ChatCompletionRequest):
         max_tokens=request.max_tokens,
     )
 
-    future = asyncio.get_running_loop().create_future()
-    seq_id = engine.add_request(prompt_token_ids, sampling_params)
-    request_futures[seq_id] = future
-
-    try:
-        token_ids = await future
-    except asyncio.CancelledError:
-        request_futures.pop(seq_id, None)
-        raise
-    except Exception as e:
-        request_futures.pop(seq_id, None)
-        raise HTTPException(status_code=500, detail=f"Inference failed: {str(e)}")
+    token_ids = await run_request(prompt_token_ids, sampling_params)
 
     text = engine.tokenizer.decode(token_ids)
 
@@ -202,6 +234,54 @@ async def chat_completions(request: ChatCompletionRequest):
     )
 
 
+@app.post("/v1/completions")
+async def completions(request: CompletionRequest):
+    if engine is None:
+        raise HTTPException(status_code=500, detail="Engine not initialized")
+    if request.stream:
+        raise HTTPException(status_code=400, detail="stream is not supported")
+    if request.top_p is not None and request.top_p != 1.0:
+        raise HTTPException(status_code=400, detail="top_p is not supported")
+
+    prompts = request.prompt if isinstance(request.prompt, list) else [request.prompt]
+    if not prompts:
+        raise HTTPException(status_code=400, detail="prompt is required")
+
+    sampling_params = SamplingParams(
+        temperature=request.temperature,
+        max_tokens=request.max_tokens,
+    )
+
+    choices: List[CompletionResponseChoice] = []
+    prompt_tokens_total = 0
+    completion_tokens_total = 0
+    for idx, prompt in enumerate(prompts):
+        prompt_token_ids = engine.tokenizer.encode(prompt)
+        prompt_tokens_total += len(prompt_token_ids)
+        token_ids = await run_request(prompt_token_ids, sampling_params)
+        completion_tokens_total += len(token_ids)
+        text = engine.tokenizer.decode(token_ids)
+        choices.append(
+            CompletionResponseChoice(
+                index=idx,
+                text=text,
+                finish_reason="stop",
+            )
+        )
+
+    return CompletionResponse(
+        id=f"cmpl-{uuid.uuid4()}",
+        created=int(time.time()),
+        model=request.model,
+        choices=choices,
+        usage={
+            "prompt_tokens": prompt_tokens_total,
+            "completion_tokens": completion_tokens_total,
+            "total_tokens": prompt_tokens_total + completion_tokens_total,
+        },
+    )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, required=True)
@@ -212,11 +292,13 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--served-model-name", type=str, default="nanovllm")
+    parser.add_argument("--shm-name", type=str, default=None)
 
     args = parser.parse_args()
     os.environ["NANOVLLM_SERVED_MODEL_NAME"] = args.served_model_name
 
     max_batched = args.max_num_batched_tokens or max(16384, args.max_model_len)
-    engine = create_engine(args.model, args.tp, args.max_model_len, max_batched, args.enforce_eager)
+    shm_name = args.shm_name or f"nanovllm-{os.getpid()}"
+    engine = create_engine(args.model, args.tp, args.max_model_len, max_batched, args.enforce_eager, shm_name)
 
     uvicorn.run(app, host=args.host, port=args.port)
