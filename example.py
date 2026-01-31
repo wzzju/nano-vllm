@@ -4,14 +4,14 @@ from transformers import AutoTokenizer
 
 
 def main():
-    path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
+    path = os.path.expanduser("/work/models/QwQ-32B/")
     tokenizer = AutoTokenizer.from_pretrained(path)
-    llm = LLM(path, enforce_eager=True, tensor_parallel_size=1)
+    llm = LLM(path, enforce_eager=False, tensor_parallel_size=8, max_model_len=32768, max_num_batched_tokens=32768)
 
     sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
     prompts = [
-        "introduce yourself",
-        "list all prime numbers within 100",
+        "请自我介绍一下",
+        "列出所有小于等于 100 的质数",
     ]
     prompts = [
         tokenizer.apply_chat_template(
