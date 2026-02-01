@@ -1,4 +1,5 @@
 import pickle
+import signal
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -43,6 +44,10 @@ class ModelRunner:
                 self.shm = SharedMemory(name=config.shm_name, create=True, size=2**20)
                 dist.barrier()
             else:
+                # Ignore SIGINT and SIGTERM in workers to allow the main process
+                # to coordinate the shutdown process via the 'exit' command.
+                signal.signal(signal.SIGINT, signal.SIG_IGN)
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
                 dist.barrier()
                 self.shm = SharedMemory(name=config.shm_name)
                 self.loop()
