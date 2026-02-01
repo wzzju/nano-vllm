@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from contextlib import contextmanager
 import torch
 
 
@@ -25,3 +26,19 @@ def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0
 def reset_context():
     global _CONTEXT
     _CONTEXT = Context()
+
+@contextmanager
+def torch_default_state(device: str = "cuda", dtype: torch.dtype | None = None):
+    """
+    A context manager to temporarily set the default torch device and dtype.
+    """
+    default_device = torch.get_default_device()
+    default_dtype = torch.get_default_dtype()
+    torch.set_default_device(device)
+    if dtype is not None:
+        torch.set_default_dtype(dtype)
+    try:
+        yield
+    finally:
+        torch.set_default_device(default_device)
+        torch.set_default_dtype(default_dtype)

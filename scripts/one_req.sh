@@ -30,7 +30,7 @@ curl http://localhost:8000/v1/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "QwQ-32B",
-    "prompt": ["请自我介绍一下", "列出1到10的质数"],
+    "prompt": ["重庆是", "列出1到10的质数"],
     "max_tokens": 128,
     "temperature": 0.6
   }'

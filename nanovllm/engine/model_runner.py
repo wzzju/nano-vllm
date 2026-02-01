@@ -9,11 +9,24 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
-from nanovllm.utils.context import set_context, get_context, reset_context
+from nanovllm.utils.context import set_context, get_context, reset_context, torch_default_state
 from nanovllm.utils.loader import load_model
 
 
 class ModelRunner:
+
+    @staticmethod
+    def _resolve_dtype(hf_config, fallback):
+        dtype = getattr(hf_config, "dtype", None)
+        if dtype is None:
+            # Use __dict__.get to bypass the deprecation warning triggered by
+            # getattr or property access in newer transformers versions.
+            dtype = hf_config.__dict__.get("torch_dtype")
+        if dtype is None:
+            dtype = fallback
+        if isinstance(dtype, str):
+            dtype = getattr(torch, dtype, fallback)
+        return dtype
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
         self.config = config
@@ -24,38 +37,36 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
-        default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(hf_config.torch_dtype)
-        torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
-        load_model(self.model, config.model)
-        self.sampler = Sampler()
-        self.warmup_model()
-        self.allocate_kv_cache()
-        if not self.enforce_eager:
-            self.capture_cudagraph()
-        torch.set_default_device("cpu")
-        torch.set_default_dtype(default_dtype)
+        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank, device_id=rank)
+
+        self.model_dtype = self._resolve_dtype(hf_config, torch.get_default_dtype())
+        with torch_default_state(device="cuda", dtype=self.model_dtype):
+            self.model = Qwen3ForCausalLM(hf_config)
+            load_model(self.model, config.model)
+            self.sampler = Sampler()
+            self.warmup_model()
+            self.allocate_kv_cache()
+            if not self.enforce_eager:
+                self.capture_cudagraph()
 
         if self.world_size > 1:
             if rank == 0:
                 self.shm = SharedMemory(name=config.shm_name, create=True, size=2**20)
-                dist.barrier()
+                dist.barrier(device_ids=[rank])
             else:
                 # Ignore SIGINT and SIGTERM in workers to allow the main process
                 # to coordinate the shutdown process via the 'exit' command.
                 signal.signal(signal.SIGINT, signal.SIG_IGN)
                 signal.signal(signal.SIGTERM, signal.SIG_IGN)
-                dist.barrier()
+                dist.barrier(device_ids=[rank])
                 self.shm = SharedMemory(name=config.shm_name)
                 self.loop()
 
     def exit(self):
         if self.world_size > 1:
             self.shm.close()
-            dist.barrier()
+            dist.barrier(device_ids=[self.rank])
             if self.rank == 0:
                 self.shm.unlink()
         if not self.enforce_eager:
@@ -111,7 +122,7 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
+        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * self.model_dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
