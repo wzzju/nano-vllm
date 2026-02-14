@@ -19,4 +19,4 @@ python3 ${SCRIPT_DIR}/../serve.py \
   --tp 8 \
   --max-model-len 32768 \
   --max-num-batched-tokens 32768 \
-  --served-model-name QwQ-32B
+  --served-model-name vllm_infer

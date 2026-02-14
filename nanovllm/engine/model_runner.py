@@ -41,6 +41,7 @@ class ModelRunner:
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank, device_id=rank)
 
         self.model_dtype = self._resolve_dtype(hf_config, torch.get_default_dtype())
+        # print(f">>> {self.model_dtype = }", flush=True)
         with torch_default_state(device="cuda", dtype=self.model_dtype):
             self.model = Qwen3ForCausalLM(hf_config)
             load_model(self.model, config.model)

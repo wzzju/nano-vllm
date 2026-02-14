@@ -40,5 +40,6 @@ def torch_default_state(device: str = "cuda", dtype: torch.dtype | None = None):
     try:
         yield
     finally:
+        if dtype is not None:
+            torch.set_default_dtype(default_dtype)
         torch.set_default_device(default_device)
-        torch.set_default_dtype(default_dtype)
